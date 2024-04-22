@@ -240,6 +240,8 @@ import UnliftIO.Async (async)
 import UnliftIO.Directory (doesFileExist, getTemporaryDirectory, removeFile)
 import qualified UnliftIO.Exception as E
 import UnliftIO.STM
+import Debug.Trace
+import Data.List (nub)
 
 type ClientVar msg = SessionVar (Either AgentErrorType (Client msg))
 
@@ -628,6 +630,7 @@ reconnectSMPClient tc c tSess@(_, srv, _) qs = do
   NetworkConfig {tcpTimeout} <- atomically $ getNetworkConfig c
   -- this allows 3x of timeout per batch of subscription (90 queues per batch empirically)
   let t = (length qs `div` 90 + 1) * tcpTimeout * 3
+  traceM $ "reconnectSMPClient: starting " <> show (tcpTimeout, t)
   ExceptT (sequence <$> (t `timeout` runExceptT resubscribe)) >>= \case
     Just _ -> atomically $ writeTVar tc 0
     Nothing -> do
@@ -635,22 +638,28 @@ reconnectSMPClient tc c tSess@(_, srv, _) qs = do
       maxTC <- asks $ maxSubscriptionTimeouts . config
       let err = if tc' >= maxTC then CRITICAL True else INTERNAL
           msg = show tc' <> " consecutive subscription timeouts: " <> show (length qs) <> " queues, transport session: " <> show tSess
+      traceM $ "reconnectSMPClient: " <> show (err msg)
       atomically $ writeTBQueue (subQ c) ("", "", APC SAEConn $ ERR $ err msg)
   where
     resubscribe :: AM ()
     resubscribe = do
       cs <- readTVarIO $ RQ.getConnections $ activeSubs c
+      traceM $ "reconnectSMPClient.resubscribe: starting " <> show (length cs, length qs)
       rs <- lift . subscribeQueues c $ L.toList qs
       let (errs, okConns) = partitionEithers $ map (\(RcvQueue {connId}, r) -> bimap (connId,) (const connId) r) rs
       liftIO $ do
         let conns = filter (`M.notMember` cs) okConns
+        traceM $ "reconnectSMPClient.resubscribe: subscribed " <> show (length errs, length okConns, length conns)
         unless (null conns) $ notifySub "" $ UP srv conns
       let (tempErrs, finalErrs) = partition (temporaryAgentError . snd) errs
+      traceM $ "reconnectSMPClient.resubscribe: errs " <> show (length tempErrs, length finalErrs)
       liftIO $ mapM_ (\(connId, e) -> notifySub connId $ ERR e) finalErrs
       forM_ (listToMaybe tempErrs) $ \(_, err) -> do
+        traceM $ "reconnectSMPClient.resubscribe: close? " <> show (null okConns, M.null cs, null finalErrs)
         when (null okConns && M.null cs && null finalErrs) . liftIO $
           closeClient c smpClients tSess
         throwError err
+      traceM $ "reconnectSMPClient.resubscribe: finished"
     notifySub :: forall e. AEntityI e => ConnId -> ACommand 'Agent e -> IO ()
     notifySub connId cmd = atomically $ writeTBQueue (subQ c) ("", connId, APC (sAEntity @e) cmd)
 
@@ -1132,9 +1141,16 @@ processSubResult :: AgentClient -> RcvQueue -> Either SMPClientError () -> IO (E
 processSubResult c rq r = do
   case r of
     Left e ->
-      unless (temporaryClientError e) . atomically $ do
-        RQ.deleteQueue rq (pendingSubs c)
-        TM.insert (RQ.qKey rq) e (removedSubs c)
+      if temporaryClientError e
+        then do
+          traceM $ "processSubResult: to pending after " <> show e
+          atomically $ do
+              RQ.deleteQueue rq (pendingSubs c)
+              TM.insert (RQ.qKey rq) e (removedSubs c)
+        else traceM $ "processSubResult: to removed with " <> show e
+      -- unless (temporaryClientError e) . atomically $ do
+      --   RQ.deleteQueue rq (pendingSubs c)
+      --   TM.insert (RQ.qKey rq) e (removedSubs c)
     _ -> addSubscription c rq
   pure r
 
@@ -1156,6 +1172,7 @@ temporaryOrHostError = \case
 subscribeQueues :: AgentClient -> [RcvQueue] -> AM' [(RcvQueue, Either AgentErrorType ())]
 subscribeQueues c qs = do
   (errs, qs') <- partitionEithers <$> mapM checkQueue qs
+  traceM $ "subscribeQueues: starting " <> show (length errs, length qs')
   atomically $ do
     modifyTVar' (subscrConns c) (`S.union` S.fromList (map qConnId qs'))
     RQ.batchAddQueues (pendingSubs c) qs'
@@ -1168,18 +1185,24 @@ subscribeQueues c qs = do
       pure $ if prohibited then Left (rq, Left $ CMD PROHIBITED) else Right rq
     subscribeQueues_ :: Env -> SMPClient -> NonEmpty RcvQueue -> IO (BatchResponses SMPClientError ())
     subscribeQueues_ env smp qs' = do
+      traceM "subscribeQueues_: started"
       rs <- sendBatch subscribeSMPQueues smp qs'
       mapM_ (uncurry $ processSubResult c) rs
-      when (any temporaryClientError . lefts . map snd $ L.toList rs) $
+      let (t, f) = partition temporaryClientError . lefts . map snd $ L.toList rs
+      traceM $ "subscribeQueues_: processed " <> show ((length t, nub t), (length f, nub f))
+      when (any temporaryClientError . lefts . map snd $ L.toList rs) $ do
         runReaderT (resubscribeSMPSession c $ transportSession' smp) env
+      traceM "subscribeQueues_: finished"
       pure rs
 
 type BatchResponses e r = (NonEmpty (RcvQueue, Either e r))
 
 -- statBatchSize is not used to batch the commands, only for traffic statistics
 sendTSessionBatches :: forall q r. ByteString -> Int -> (q -> RcvQueue) -> (SMPClient -> NonEmpty q -> IO (BatchResponses SMPClientError r)) -> AgentClient -> [q] -> AM' [(RcvQueue, Either AgentErrorType r)]
-sendTSessionBatches statCmd statBatchSize toRQ action c qs =
-  concatMap L.toList <$> (mapConcurrently sendClientBatch =<< batchQueues)
+sendTSessionBatches statCmd statBatchSize toRQ action c qs = do
+  traceM ("sendTSessionBatches: started " <> show (statCmd, statBatchSize, length qs))
+  r <- concatMap L.toList <$> (mapConcurrently sendClientBatch =<< batchQueues)
+  r <$ traceM ("sendTSessionBatches: finished " <> show (length r))
   where
     batchQueues :: AM' [(SMPTransportSession, NonEmpty q)]
     batchQueues = do
@@ -1190,12 +1213,23 @@ sendTSessionBatches statCmd statBatchSize toRQ action c qs =
           let tSess = mkSMPTSession (toRQ q) mode
            in M.alter (Just . maybe [q] (q <|)) tSess m
     sendClientBatch :: (SMPTransportSession, NonEmpty q) -> AM' (BatchResponses AgentErrorType r)
-    sendClientBatch (tSess@(userId, srv, _), qs') =
+    sendClientBatch (tSess@(userId, srv, _), qs') = do
+      traceM $ "sendClientBatch: getting client for " <> show (strEncode srv)
       tryAgentError' (getSMPServerClient c tSess) >>= \case
-        Left e -> pure $ L.map ((,Left e) . toRQ) qs'
+        Left e -> do
+          traceM $ "sendClientBatch: failed to get client for " <> show (strEncode srv) <> " : " <> show e
+          pure $ L.map ((,Left e) . toRQ) qs'
         Right smp -> liftIO $ do
+          traceM $ "sendClientBatch: got client for " <> show (strEncode srv)
           logServer "-->" c srv (bshow (length qs') <> " queues") statCmd
-          rs <- L.map agentError <$> action smp qs'
+          rs <- E.try (L.map agentError <$> action smp qs') >>= \case
+            Left oops@(E.SomeException e) -> do
+              traceM $ "sendClientBatch: client action crashed for " <> show (strEncode srv) <> " : " <> show e
+              E.throwIO oops
+            Right ok -> do
+              let (errs, rs) = partitionEithers $ map snd $ L.toList ok
+              traceM $ "sendClientBatch: client action finished for " <> show (strEncode srv) <> " : " <> show (length errs, length rs)
+              pure ok
           statBatch
           pure rs
           where
@@ -1211,6 +1245,7 @@ sendBatch smpCmdFunc smp qs = L.zip qs <$> smpCmdFunc smp (L.map queueCreds qs)
 
 addSubscription :: AgentClient -> RcvQueue -> IO ()
 addSubscription c rq@RcvQueue {connId} = atomically $ do
+  traceM $ "addSubscription: " <> show (logSecret connId)
   modifyTVar' (subscrConns c) $ S.insert connId
   RQ.addQueue rq $ activeSubs c
   RQ.deleteQueue rq $ pendingSubs c
